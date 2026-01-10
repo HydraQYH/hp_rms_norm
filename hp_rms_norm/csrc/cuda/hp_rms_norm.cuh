@@ -8,6 +8,7 @@
 #include <cuda/ptx>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cooperative_groups/memcpy_async.h>
 
 namespace hp_rms_norm {
 
@@ -56,6 +57,23 @@ template<> struct UVTypeTrait<__half, 32> {
   using U = U32B_f162;
   using V = longlong4;
 };
+
+template<typename T>
+__device__ __forceinline__ void square_sum(float2& acc, T& val);
+
+template<>
+__device__ __forceinline__ void square_sum<__nv_bfloat162>(float2& acc, __nv_bfloat162& val) {
+  float2 valf = __bfloat1622float2(val);
+  acc.x += valf.x * valf.x;
+  acc.y += valf.y * valf.y;
+}
+
+template<>
+__device__ __forceinline__ void square_sum<__half2>(float2& acc, __half2& val) {
+  float2 valf = __half22float2(val);
+  acc.x += valf.x * valf.x;
+  acc.y += valf.y * valf.y;
+}
 
 template<typename T>
 __device__ __forceinline__ T rms_residual(T& val, T& weight, T&residual, float rsqrt_square_sum);
@@ -210,7 +228,7 @@ __global__ void rms_norm_vector_kernel(
         (threadIdx.x < blockDim.x / 32) ? buffer[threadIdx.x] : 0.0f,
         cooperative_groups::plus<float>()
       );
-      buffer[threadIdx.x] = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T))))) ;
+      buffer[threadIdx.x] = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T)))));
     }
     __syncthreads();
 
@@ -245,7 +263,7 @@ __global__ void rms_norm_vector_kernel(
 }
 
 template<typename T, int VEC_SIZE_IN_BYTE, int REG_VEC_SIZE>
-__global__ void rms_norm_vector_kernel_plus(
+__global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
     const T* __restrict__ input,
     const T* __restrict__ weight,
     const T* __restrict__ residual,
@@ -265,87 +283,110 @@ __global__ void rms_norm_vector_kernel_plus(
   int iteration = (vec_hidden_dim + threads - 1) / threads;
 
   // Use for warp reduce
-  auto cg_warp = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());
-
-  // Used for TMA 1D G2S Copy Sync
-  barrier* mbarrier = reinterpret_cast<barrier*>(shared_memory + shm_round * vec_hidden_dim * VEC_SIZE_IN_BYTE + 32 * sizeof(float));
+  auto cg_block = cooperative_groups::this_thread_block();
+  auto cta = cooperative_groups::tiled_partition<1024>(cg_block);
 
   int token_id = static_cast<int>(blockIdx.x);
   if (token_id < tokens) {
-    // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
-    //    b) Make initialized barrier visible in async proxy.
-    if (threadIdx.x == 0) {
-      init(mbarrier, blockDim.x);
-      // cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);   // b)
-    }
-    __syncthreads();
-
-    // 2. Initiate TMA transfer to copy global to shared memory.
-    if (threadIdx.x == 0) {
-      // 3a. cuda::memcpy_async arrives on the barrier and communicates
-      //     how many bytes are expected to come in (the transaction count)
-      cuda::memcpy_async(
-          shared_memory,
-          weight,
-          cuda::aligned_size_t<16>(vec_hidden_dim * VEC_SIZE_IN_BYTE),
-          *mbarrier
-      );
-    }
+    // Cooperatively issue the copies across all threads.
+    cooperative_groups::memcpy_async(
+      cg_block,
+      shared_memory + shm_round * threads * VEC_SIZE_IN_BYTE,
+      reinterpret_cast<const uint8_t*>(weight),
+      vec_hidden_dim * VEC_SIZE_IN_BYTE
+    );
   } else {
     return;
   }
 
-  // 3b. All threads arrive on the barrier
-  __syncthreads();
-  barrier::arrival_token arrival_token = mbarrier->arrive();
-
   while (token_id < tokens) {
     U u[REG_VEC_SIZE];  // Save input
-    U u_res[REG_VEC_SIZE];  // Save residual
-    U u_weight[REG_VEC_SIZE]; // Save weight
-    U u_out[REG_VEC_SIZE];  // Save output
     float2 acc_square = make_float2(0.0f, 0.0f);
 
-    // TODO: Load data
+    // Ptr offset
+    const V* p = reinterpret_cast<const V*>(input) + token_id * vec_hidden_dim;
     for (int i = 0; i < iteration; i++) {
-      if (iteration < REG_VEC_SIZE) {
-
-      } else {
-
+      auto offset = threadIdx.x + i * threads;
+      if (offset < vec_hidden_dim && i < REG_VEC_SIZE) {
+        // Store in registers
+        u[i].memory_type = p[offset];
+        if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          for (int j = 0; j < 4; j++) {
+            square_sum(acc_square, u[i].real_type[j]);
+          }
+        } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          for (int j = 0; j < 8; j++) {
+            square_sum(acc_square, u[i].real_type[j]);
+          }
+        }
+      } else if (offset < vec_hidden_dim) {
+        // Store in shared memory
+        V* p_shm = reinterpret_cast<V*>(shared_memory) + (i - REG_VEC_SIZE) * threads;
+        U tmp;
+        tmp.memory_type = p[offset];
+        if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          for (int j = 0; j < 4; j++) {
+            square_sum(acc_square, tmp.real_type[j]);
+          }
+        } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          for (int j = 0; j < 8; j++) {
+            square_sum(acc_square, tmp.real_type[j]);
+          }
+        }
+        p_shm[threadIdx.x] = tmp.memory_type;
       }
     }
 
-    // Warp Reduce
-    float warp_sum = cooperative_groups::reduce(
-      cg_warp,
+    // CTA Reduce
+    float cta_sum = cooperative_groups::reduce(
+      cta,
       acc_square.x + acc_square.y,
       cooperative_groups::plus<float>()
     );
-
-    // Wirte warp_sum to buffer
-    float* buffer = reinterpret_cast<float*>(shared_memory + shm_round * vec_hidden_dim * VEC_SIZE_IN_BYTE);
-    if (threadIdx.x % 32 == 0) {
-      buffer[threadIdx.x / 32] = warp_sum;
+    float scale = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T))))) ;
+    
+    // Wait weight arrive
+    if (token_id == static_cast<int>(blockIdx.x)) {
+      cooperative_groups::wait(cg_block);
     }
-
-    // CTA Reduce
-    __syncthreads();
-    if (threadIdx.x < 32) {
-      float cta_sum = cooperative_groups::reduce(
-        cg_warp,
-        buffer[threadIdx.x],
-        cooperative_groups::plus<float>()
-      );
-      buffer[threadIdx.x] = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T))))) ;
-    }
-    __syncthreads();
 
     // TODO: RMS Norm
+    const V* p_res = reinterpret_cast<const V*>(residual) + token_id * vec_hidden_dim;
+    V* p_out = reinterpret_cast<V*>(output) + token_id * vec_hidden_dim;
     for (int i = 0; i < iteration; i++) {
-      if (iteration < REG_VEC_SIZE) {
+      auto offset = threadIdx.x + i * threads;
+      U u_out;
+      U u_res;
+      u_res.memory_type = p_res[offset];  // LDG
+      U u_weight;
+      V* p_weight = reinterpret_cast<V*>(shared_memory + shm_round * threads * VEC_SIZE_IN_BYTE);
+      u_weight.memory_type = p_weight[offset];  // LDS
+      if (offset < vec_hidden_dim && i < REG_VEC_SIZE) {
+        if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          for (int j = 0; j < 4; j++) {
+            u_out.real_type[i] = rms_residual(u[i].real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+          }
+        } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          for (int j = 0; j < 8; j++) {
+            u_out.real_type[i] = rms_residual(u[i].real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+          }
+        }
+        p_out[offset] = u_out.memory_type;
+      } else if (offset < vec_hidden_dim) {
+        V* p_shm = reinterpret_cast<V*>(shared_memory) + (i - REG_VEC_SIZE) * threads;
+        U shm_inp;
+        shm_inp.memory_type = p_shm[threadIdx.x];
 
-      } else {
-
+        if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          for (int j = 0; j < 4; j++) {
+            u_out.real_type[i] = rms_residual(shm_inp.real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+          }
+        } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          for (int j = 0; j < 8; j++) {
+            u_out.real_type[i] = rms_residual(shm_inp.real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+          }
+        }
+        p_out[offset] = u_out.memory_type;
       }
     }
 
@@ -390,9 +431,30 @@ void launch_rms_norm_vector(
       input, weight, residual, output, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps)
     );
   } else {
+    constexpr int reg_vec_size = 2;
     dim3 block(1024, 1, 1);
-    int smem_size = at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin / 2;
-    assert(false);
+    void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_kernel_plus<T, VEC_SIZE_IN_BYTE, reg_vec_size>);
+    
+    size_t smem_size = 0;
+    AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, 2, 1024));
+    assert(smem_size <= INT32_MAX);
+    int shm_round = static_cast<int>((static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE) / (1024 * VEC_SIZE_IN_BYTE));
+    std::cout << "shm_round: " << shm_round << std::endl;
+
+    AT_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel_ptr,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      smem_size));
+
+    dim3 grid(at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 2, 1, 1);
+
+    // Kernel Launch
+    assert(tokens <= INT32_MAX);
+    assert((vec_hidden_dim + 1023 / 1024) <= (reg_vec_size + shm_round));
+
+    rms_norm_vector_kernel_plus<T, VEC_SIZE_IN_BYTE, reg_vec_size><<<grid, block, smem_size, stream>>>(
+      input, weight, residual, output, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps), shm_round
+    );
   }
 }
 
