@@ -264,7 +264,7 @@ __global__ void rms_norm_vector_kernel(
 }
 
 template<typename T, int VEC_SIZE_IN_BYTE, int NUM_THREADS>
-__global__ void rms_norm_vector_kernel_plus(  // __maxnreg__(64)
+__global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
     const T* __restrict__ input,
     const T* __restrict__ weight,
     const T* __restrict__ residual,
