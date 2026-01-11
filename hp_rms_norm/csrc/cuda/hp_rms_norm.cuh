@@ -287,17 +287,37 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
   auto cta = cooperative_groups::tiled_partition<1024>(cg_block);
 
   int token_id = static_cast<int>(blockIdx.x);
+
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ barrier mbarrier;
+
   if (token_id < tokens) {
-    // Cooperatively issue the copies across all threads.
-    cooperative_groups::memcpy_async(
-      cg_block,
-      shared_memory + shm_round * threads * VEC_SIZE_IN_BYTE,
-      reinterpret_cast<const uint8_t*>(weight),
-      vec_hidden_dim * VEC_SIZE_IN_BYTE
-    );
+    // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
+    //    b) Make initialized barrier visible in async proxy.
+    if (threadIdx.x == 0) {
+      init(&mbarrier, blockDim.x);
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);   // b)
+    }
+    __syncthreads();
+
+    // 2. Initiate TMA transfer to copy global to shared memory.
+    if (threadIdx.x == 0) {
+      // 3a. cuda::memcpy_async arrives on the barrier and communicates
+      //     how many bytes are expected to come in (the transaction count)
+      cuda::memcpy_async(
+          shared_memory + shm_round * threads * VEC_SIZE_IN_BYTE,
+          weight,
+          cuda::aligned_size_t<16>(vec_hidden_dim * VEC_SIZE_IN_BYTE),
+          mbarrier
+      );
+    }
   } else {
     return;
   }
+
+  // 3b. All threads arrive on the barrier
+  __syncthreads();
+  barrier::arrival_token arrival_token = mbarrier.arrive();
 
   while (token_id < tokens) {
     U u[REG_VEC_SIZE];  // Save input
@@ -305,16 +325,19 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
 
     // Ptr offset
     const V* p = reinterpret_cast<const V*>(input) + token_id * vec_hidden_dim;
+    #pragma unroll 1
     for (int i = 0; i < iteration; i++) {
       auto offset = threadIdx.x + i * threads;
       if (offset < vec_hidden_dim && i < REG_VEC_SIZE) {
         // Store in registers
         u[i].memory_type = p[offset];
         if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          #pragma unroll 1
           for (int j = 0; j < 4; j++) {
             square_sum(acc_square, u[i].real_type[j]);
           }
         } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          #pragma unroll 1
           for (int j = 0; j < 8; j++) {
             square_sum(acc_square, u[i].real_type[j]);
           }
@@ -325,10 +348,12 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
         U tmp;
         tmp.memory_type = p[offset];
         if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          #pragma unroll 1
           for (int j = 0; j < 4; j++) {
             square_sum(acc_square, tmp.real_type[j]);
           }
         } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          #pragma unroll 1
           for (int j = 0; j < 8; j++) {
             square_sum(acc_square, tmp.real_type[j]);
           }
@@ -343,32 +368,37 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
       acc_square.x + acc_square.y,
       cooperative_groups::plus<float>()
     );
-    float scale = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T))))) ;
-    
-    // Wait weight arrive
+    float scale = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T)))));
+
     if (token_id == static_cast<int>(blockIdx.x)) {
-      cooperative_groups::wait(cg_block);
+      // First time
+      mbarrier.wait(std::move(arrival_token));
     }
 
     // TODO: RMS Norm
     const V* p_res = reinterpret_cast<const V*>(residual) + token_id * vec_hidden_dim;
     V* p_out = reinterpret_cast<V*>(output) + token_id * vec_hidden_dim;
+    V* p_weight = reinterpret_cast<V*>(shared_memory + shm_round * threads * VEC_SIZE_IN_BYTE);
+    #pragma unroll 1
     for (int i = 0; i < iteration; i++) {
       auto offset = threadIdx.x + i * threads;
       U u_out;
       U u_res;
-      u_res.memory_type = p_res[offset];  // LDG
       U u_weight;
-      V* p_weight = reinterpret_cast<V*>(shared_memory + shm_round * threads * VEC_SIZE_IN_BYTE);
-      u_weight.memory_type = p_weight[offset];  // LDS
+      if (offset < vec_hidden_dim) {
+        u_res.memory_type = p_res[offset];  // LDG
+        u_weight.memory_type = p_weight[offset];  // LDS
+      }
       if (offset < vec_hidden_dim && i < REG_VEC_SIZE) {
         if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          #pragma unroll 1
           for (int j = 0; j < 4; j++) {
-            u_out.real_type[i] = rms_residual(u[i].real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+            u_out.real_type[j] = rms_residual(u[i].real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
           }
         } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          #pragma unroll 1
           for (int j = 0; j < 8; j++) {
-            u_out.real_type[i] = rms_residual(u[i].real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+            u_out.real_type[j] = rms_residual(u[i].real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
           }
         }
         p_out[offset] = u_out.memory_type;
@@ -378,12 +408,14 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
         shm_inp.memory_type = p_shm[threadIdx.x];
 
         if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          #pragma unroll 1
           for (int j = 0; j < 4; j++) {
-            u_out.real_type[i] = rms_residual(shm_inp.real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+            u_out.real_type[j] = rms_residual(shm_inp.real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
           }
         } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          #pragma unroll 1
           for (int j = 0; j < 8; j++) {
-            u_out.real_type[i] = rms_residual(shm_inp.real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
+            u_out.real_type[j] = rms_residual(shm_inp.real_type[j], u_weight.real_type[j], u_res.real_type[j], scale);
           }
         }
         p_out[offset] = u_out.memory_type;
@@ -439,7 +471,6 @@ void launch_rms_norm_vector(
     AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, 2, 1024));
     assert(smem_size <= INT32_MAX);
     int shm_round = static_cast<int>((static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE) / (1024 * VEC_SIZE_IN_BYTE));
-    std::cout << "shm_round: " << shm_round << std::endl;
 
     AT_CUDA_CHECK(cudaFuncSetAttribute(
       kernel_ptr,
