@@ -112,10 +112,9 @@ __device__ __forceinline__ __half2 rms<__half2>(
 
 template<typename T, int VEC_SIZE_IN_BYTE>
 __global__ void rms_norm_vector_kernel(
-    const T* __restrict__ input,
+    T* __restrict__ input,
     const T* __restrict__ weight,
     T* __restrict__ residual,
-    T* __restrict__ output,
     int tokens,
     int vec_hidden_dim,
     float eps
@@ -267,7 +266,7 @@ __global__ void rms_norm_vector_kernel(
         }
       }
 
-      V* p_out = reinterpret_cast<V*>(output) + token_id * vec_hidden_dim;
+      V* p_out = reinterpret_cast<V*>(input) + token_id * vec_hidden_dim;
       p_out[threadIdx.x] = u_out.memory_type;
     }
     token_id += static_cast<int>(gridDim.x);
@@ -276,10 +275,9 @@ __global__ void rms_norm_vector_kernel(
 
 template<typename T, int VEC_SIZE_IN_BYTE, int NUM_THREADS>
 __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
-    const T* __restrict__ input,
+    T* __restrict__ input,
     const T* __restrict__ weight,
     T* __restrict__ residual,
-    T* __restrict__ output,
     int tokens,
     int vec_hidden_dim,
     float eps,
@@ -469,7 +467,7 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
       mbarrier.wait(std::move(arrival_token));
     }
 
-    V* p_out = reinterpret_cast<V*>(output) + token_id * vec_hidden_dim;
+    V* p_out = reinterpret_cast<V*>(input) + token_id * vec_hidden_dim;
     V* p_weight = reinterpret_cast<V*>(shared_memory);
 
     U u_out;
@@ -518,8 +516,7 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
 
 template<typename T, int VEC_SIZE_IN_BYTE>
 void launch_rms_norm_vector(
-    T* output,
-    const T* input,
+    T* input,
     const T* weight,
     T* residual,
     size_t tokens,
@@ -549,7 +546,7 @@ void launch_rms_norm_vector(
     // Kernel Launch
     TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
     rms_norm_vector_kernel<T, VEC_SIZE_IN_BYTE><<<grid, block, smem_size, stream>>>(
-      input, weight, residual, output, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps)
+      input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps)
     );
   } else {
     constexpr int num_threads = 1024;
@@ -581,15 +578,14 @@ void launch_rms_norm_vector(
     // Kernel Launch
     TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
     rms_norm_vector_kernel_plus<T, VEC_SIZE_IN_BYTE, num_threads><<<grid, block, smem_size, stream>>>(
-      input, weight, residual, output, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps), shm_for_inp
+      input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps), shm_for_inp
     );
   }
 }
 
 template<typename T>
 void launch_rms_norm(
-    T* output,
-    const T* input,
+    T* input,
     const T* weight,
     T* residual,
     size_t tokens,
@@ -602,7 +598,7 @@ void launch_rms_norm(
   assert(hidden_dim % elements_in_vec == 0);
   int vec_hidden_dim = hidden_dim / elements_in_vec;
   launch_rms_norm_vector<T, max_vec_size_byte>(
-    output, input, weight, residual, tokens, vec_hidden_dim, eps, stream
+    input, weight, residual, tokens, vec_hidden_dim, eps, stream
   );
 }
 

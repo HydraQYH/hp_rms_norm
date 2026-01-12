@@ -1,7 +1,7 @@
 import random
 import torch
 import hp_rms_norm
-
+from flashinfer.norm import fused_add_rmsnorm
 
 def ref_rms_norm(
     inp: torch.Tensor,
@@ -26,21 +26,30 @@ def check_diff(tokens: int, hidden_dim: int, eps: float=0.0, dtype: torch.dtype=
     rtol = 1e-3
     atol = 1e-5
 
-  inp = torch.normal(0, 0.1, (tokens, hidden_dim), dtype=dtype, device='cuda')
-  res = torch.normal(0, 0.1, (tokens, hidden_dim), dtype=dtype, device='cuda')
+  inp_ref = torch.normal(0, 0.1, (tokens, hidden_dim), dtype=dtype, device='cuda')
+  res_ref = torch.normal(0, 0.1, (tokens, hidden_dim), dtype=dtype, device='cuda')
   weight = torch.normal(0, 0.1, (hidden_dim,), dtype=dtype, device='cuda')
-  out = torch.zeros_like(inp)
-  ref_out, inp_res = ref_rms_norm(inp, res, weight, eps)
-  hp_rms_norm.hp_rms_norm(out, inp, weight, res, eps)
+
+  inp = torch.empty_like(inp_ref).copy_(inp_ref)
+  res = torch.empty_like(res_ref).copy_(res_ref)
+  inp_flashinfer = torch.empty_like(inp_ref).copy_(inp_ref)
+  res_flashinfer = torch.empty_like(res_ref).copy_(res_ref)
+
+  ref_out, inp_res = ref_rms_norm(inp_ref, res_ref, weight, eps)
+  fused_add_rmsnorm(inp_flashinfer, res_flashinfer, weight, eps=eps)
+  hp_rms_norm.hp_rms_norm(inp, weight, res, eps)
+
   torch.cuda.synchronize()
-  torch.testing.assert_close(out, ref_out, rtol=rtol, atol=atol)
+  torch.testing.assert_close(inp, ref_out, rtol=rtol, atol=atol)
   torch.testing.assert_close(res, inp_res, rtol=rtol, atol=atol)
+  torch.testing.assert_close(inp, inp_flashinfer, rtol=rtol, atol=atol)
+  torch.testing.assert_close(res, res_flashinfer, rtol=rtol, atol=atol)
 
 if __name__ == '__main__':
-  for dtype in [torch.bfloat16, torch.float16]:
-    for hidden_dim in range(128, 20608 + 128, 128):
-      tokens = random.randint(1, 4096)
-      check_diff(tokens, hidden_dim, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
-      print(f"Check tokens {tokens}, hidden_dim {hidden_dim}, dtype {dtype} Done!")
-  # check_diff(4096, 8192, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
-  # check_diff(4096, 16384, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+  # for dtype in [torch.bfloat16, torch.float16]:
+  #   for hidden_dim in range(128, 20608 + 128, 128):
+  #     tokens = random.randint(1, 4096)
+  #     check_diff(tokens, hidden_dim, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+  #     print(f"Check tokens {tokens}, hidden_dim {hidden_dim}, dtype {dtype} Done!")
+  check_diff(4096, 8192, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+  check_diff(4096, 16384, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)

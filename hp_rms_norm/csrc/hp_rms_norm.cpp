@@ -22,15 +22,14 @@ extern "C" {
 
 // Declaration
 void rms_norm(
-    torch::Tensor& output,
-    const torch::Tensor& input,
+    torch::Tensor& input,
     const torch::Tensor& weight,
-    const torch::Tensor& residual,
+    torch::Tensor& residual,
     double eps);
 
 // Defines the operators
 TORCH_LIBRARY(hp_rms_norm, m) {
-  m.def("rms_norm(Tensor output, Tensor input, Tensor weight, Tensor residual, float eps) -> ()");
+  m.def("rms_norm(Tensor input, Tensor weight, Tensor residual, float eps) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hp_rms_norm, CUDA, m) {
