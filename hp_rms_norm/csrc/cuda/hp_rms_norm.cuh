@@ -563,14 +563,21 @@ void launch_rms_norm_vector(
       kernel_ptr,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin - kernel_attr.sharedSizeBytes));
-    size_t smem_size = 0;
-    AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, num_ctas_per_sm, num_threads));
-    TORCH_CHECK(66560 <= smem_size);
-    smem_size = 66560;
-    int shm_for_inp = (static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128);
+    
+    // Occupancy 100%, 81920 from ncu
+    size_t smem_size = 81920;
+    uint persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm;
+    int shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
+    if (shm_for_inp < (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE)) {
+      // The rest part of hidden_state can not fit in shared memory
+      AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, num_ctas_per_sm, num_threads));
+      persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+      shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
+    }
+    // Check again
     TORCH_CHECK(shm_for_inp >= (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE), "hidden_dim too large.");
 
-    dim3 grid(at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm, 1, 1);
+    dim3 grid(persistent_ctas, 1, 1);
     // Kernel Launch
     TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
     rms_norm_vector_kernel_plus<T, VEC_SIZE_IN_BYTE, num_threads><<<grid, block, smem_size, stream>>>(
