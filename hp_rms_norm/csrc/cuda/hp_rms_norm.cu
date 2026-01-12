@@ -35,7 +35,7 @@ void rms_norm(
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(residual.data_ptr()),  // Inplace write
         static_cast<size_t>(tokens),
         static_cast<int>(hidden_dim),
         eps,
@@ -45,7 +45,7 @@ void rms_norm(
         reinterpret_cast<__half*>(output.data_ptr()),
         reinterpret_cast<const __half*>(input.data_ptr()),
         reinterpret_cast<const __half*>(weight.data_ptr()),
-        reinterpret_cast<const __half*>(residual.data_ptr()),
+        reinterpret_cast<__half*>(residual.data_ptr()), // Inplace write
         static_cast<size_t>(tokens),
         static_cast<int>(hidden_dim),
         eps,
