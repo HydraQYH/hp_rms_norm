@@ -27,12 +27,12 @@ union U16B_f162{
 };
 
 union U32B_bf162{
-  longlong4 memory_type;
+  longlong4_32a memory_type;
   __nv_bfloat162 real_type[8];
 };
 
 union U32B_f162{
-  longlong4 memory_type;
+  longlong4_32a memory_type;
   __half2 real_type[8];
 };
 
@@ -51,12 +51,12 @@ template<> struct UVTypeTrait<__half, 16> {
 
 template<> struct UVTypeTrait<__nv_bfloat16, 32> {
   using U = U32B_bf162;
-  using V = longlong4;
+  using V = longlong4_32a;
 };
 
 template<> struct UVTypeTrait<__half, 32> {
   using U = U32B_f162;
-  using V = longlong4;
+  using V = longlong4_32a;
 };
 
 template<typename T>
@@ -592,14 +592,23 @@ void launch_rms_norm(
     int hidden_dim,
     double eps,
     cudaStream_t stream) {
-  // TODO: B200
-  constexpr int max_vec_size_byte = 16;
-  int elements_in_vec = max_vec_size_byte / sizeof(T);
-  assert(hidden_dim % elements_in_vec == 0);
-  int vec_hidden_dim = hidden_dim / elements_in_vec;
-  launch_rms_norm_vector<T, max_vec_size_byte>(
-    input, weight, residual, tokens, vec_hidden_dim, eps, stream
-  );
+  if (at::cuda::getCurrentDeviceProperties()->major >= 10) {
+    constexpr int max_vec_size_byte = 32;
+    int elements_in_vec = max_vec_size_byte / sizeof(T);
+    assert(hidden_dim % elements_in_vec == 0);
+    int vec_hidden_dim = hidden_dim / elements_in_vec;
+    launch_rms_norm_vector<T, max_vec_size_byte>(
+      input, weight, residual, tokens, vec_hidden_dim, eps, stream
+    );
+  } else if (at::cuda::getCurrentDeviceProperties()->major == 9) {
+    constexpr int max_vec_size_byte = 16;
+    int elements_in_vec = max_vec_size_byte / sizeof(T);
+    assert(hidden_dim % elements_in_vec == 0);
+    int vec_hidden_dim = hidden_dim / elements_in_vec;
+    launch_rms_norm_vector<T, max_vec_size_byte>(
+      input, weight, residual, tokens, vec_hidden_dim, eps, stream
+    );
+  }
 }
 
 } // hp_rms_norm
