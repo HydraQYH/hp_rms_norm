@@ -46,10 +46,15 @@ def check_diff(tokens: int, hidden_dim: int, eps: float=0.0, dtype: torch.dtype=
   torch.testing.assert_close(res, res_flashinfer, rtol=rtol, atol=atol)
 
 if __name__ == '__main__':
-  # for dtype in [torch.bfloat16, torch.float16]:
-  #   for hidden_dim in range(128, 20608 + 128, 128):
-  #     tokens = random.randint(1, 4096)
-  #     check_diff(tokens, hidden_dim, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
-  #     print(f"Check tokens {tokens}, hidden_dim {hidden_dim}, dtype {dtype} Done!")
-  check_diff(4096, 8192, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
-  check_diff(4096, 16384, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+  for dtype in [torch.bfloat16, torch.float16]:
+    for hidden_dim in range(128, 32768 + 128, 128):
+      tokens = random.randint(1, 4096)
+      check_diff(tokens, hidden_dim, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+      print(f"Check tokens {tokens}, hidden_dim {hidden_dim}, dtype {dtype} Done!")
+
+  # for h in range(1024, 16384 + 1024, 1024):
+  #   check_diff(4096, h, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+  #   print(f"hidden_dim {h}, Done!")
+  # for h in range(16384 + 4096, 32768 + 1024, 4096):
+  #   check_diff(4096, h, eps=torch.finfo(torch.bfloat16).eps, dtype=torch.bfloat16)
+  #   print(f"hidden_dim {h}, Done!")

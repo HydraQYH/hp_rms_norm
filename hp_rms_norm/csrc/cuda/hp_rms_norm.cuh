@@ -111,7 +111,7 @@ __device__ __forceinline__ __half2 rms<__half2>(
 }
 
 template<typename T, int VEC_SIZE_IN_BYTE>
-__global__ void rms_norm_vector_kernel(
+__global__ void rms_norm_vector_reg_kernel(
     T* __restrict__ input,
     const T* __restrict__ weight,
     T* __restrict__ residual,
@@ -273,8 +273,8 @@ __global__ void rms_norm_vector_kernel(
   }
 }
 
-template<typename T, int VEC_SIZE_IN_BYTE, int NUM_THREADS>
-__global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
+template<typename T, int VEC_SIZE_IN_BYTE, int NUM_WARPS, int MAXNREG>
+__global__ void __maxnreg__(MAXNREG) rms_norm_vector_reg_shm_kernel(
     T* __restrict__ input,
     const T* __restrict__ weight,
     T* __restrict__ residual,
@@ -283,7 +283,7 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
     float eps,
     int shm_for_inp
 ) {
-  constexpr int threads = NUM_THREADS;
+  constexpr int threads = NUM_WARPS * 32;
   using U = typename UVTypeTrait<T, VEC_SIZE_IN_BYTE>::U;
   using V = typename UVTypeTrait<T, VEC_SIZE_IN_BYTE>::V;
   extern __shared__ __align__(128) uint8_t shared_memory[];
@@ -454,7 +454,7 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
     if (threadIdx.x < 32) {
       float cta_sum = cooperative_groups::reduce(
         cg_warp,
-        buffer[threadIdx.x],
+        threadIdx.x < NUM_WARPS ? buffer[threadIdx.x] : 0.0f,
         cooperative_groups::plus<float>()
       );
       buffer[threadIdx.x] = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T)))));
@@ -515,7 +515,7 @@ __global__ void __maxnreg__(32) rms_norm_vector_kernel_plus(
 }
 
 template<typename T, int VEC_SIZE_IN_BYTE>
-void launch_rms_norm_vector(
+void launch_rms_norm_vector_reg(
     T* input,
     const T* weight,
     T* residual,
@@ -524,63 +524,68 @@ void launch_rms_norm_vector(
     double eps,
     cudaStream_t stream
 ) {
-  if (vec_hidden_dim <= 1024) {
-    uint threads = (vec_hidden_dim + 31) / 32 * 32;
+  // Align to 32(warp)
+  uint threads = (vec_hidden_dim + 31) / 32 * 32;
 
-    dim3 block(threads, 1, 1);
-    // 32 * sizeof(float) -- CTA Reduce
-    // vec_hidden_dim * VEC_SIZE_IN_BYTE -- Save weight
-    // 8 -- mbarrier
-    int smem_size = 32 * sizeof(float) + vec_hidden_dim * VEC_SIZE_IN_BYTE + 8;
-    void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_kernel<T, VEC_SIZE_IN_BYTE>);
+  dim3 block(threads, 1, 1);
+  // 32 * sizeof(float) -- CTA Reduce
+  // vec_hidden_dim * VEC_SIZE_IN_BYTE -- Save weight
+  // 8 -- mbarrier
+  int smem_size = 32 * sizeof(float) + vec_hidden_dim * VEC_SIZE_IN_BYTE + 8;
+  void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_reg_kernel<T, VEC_SIZE_IN_BYTE>);
+  AT_CUDA_CHECK(cudaFuncSetAttribute(
+    kernel_ptr,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    smem_size)
+  );
 
-    int max_active_blocks_per_sm = -1;
-    AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks_per_sm, kernel_ptr, vec_hidden_dim, smem_size));
-    dim3 grid(at::cuda::getCurrentDeviceProperties()->multiProcessorCount * max_active_blocks_per_sm, 1, 1);
-  
-    AT_CUDA_CHECK(cudaFuncSetAttribute(
-      kernel_ptr,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      smem_size));
+  int max_active_blocks_per_sm = -1;
+  AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks_per_sm, kernel_ptr, threads, smem_size));
+  dim3 grid(at::cuda::getCurrentDeviceProperties()->multiProcessorCount * max_active_blocks_per_sm, 1, 1);
 
-    // Kernel Launch
-    TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
-    rms_norm_vector_kernel<T, VEC_SIZE_IN_BYTE><<<grid, block, smem_size, stream>>>(
-      input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps)
-    );
-  } else {
-    constexpr int num_threads = 1024;
-    constexpr int num_ctas_per_sm = 2;
-    dim3 block(num_threads, 1, 1);
-    void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_kernel_plus<T, VEC_SIZE_IN_BYTE, num_threads>);
+  // Kernel Launch
+  TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
+  rms_norm_vector_reg_kernel<T, VEC_SIZE_IN_BYTE><<<grid, block, smem_size, stream>>>(
+    input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps)
+  );
+}
 
-    cudaFuncAttributes kernel_attr;
-    AT_CUDA_CHECK(cudaFuncGetAttributes(&kernel_attr, kernel_ptr));
-    AT_CUDA_CHECK(cudaFuncSetAttribute(
-      kernel_ptr,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin - kernel_attr.sharedSizeBytes));
-    
-    // Occupancy 100%, 81920 from ncu
-    size_t smem_size = 81920;
-    uint persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm;
-    int shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
-    if (shm_for_inp < (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE)) {
-      // The rest part of hidden_state can not fit in shared memory
-      AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, num_ctas_per_sm, num_threads));
-      persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-      shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
-    }
-    // Check again
-    TORCH_CHECK(shm_for_inp >= (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE), "hidden_dim too large.");
+template<typename T, int VEC_SIZE_IN_BYTE, int NUM_THREADS, int NUM_CTAS_PER_SM>
+void launch_rms_norm_vector_reg_shm(
+    T* input,
+    const T* weight,
+    T* residual,
+    size_t tokens,
+    int vec_hidden_dim,
+    double eps,
+    cudaStream_t stream
+) {
+  constexpr int num_threads = NUM_THREADS;
+  constexpr int num_warps = NUM_THREADS / 32;
+  constexpr int num_ctas_per_sm = NUM_CTAS_PER_SM;
+  constexpr int maxnreg = (num_warps == 1024 ? 32 : 64);
+  dim3 block(num_threads, 1, 1);
+  void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_reg_shm_kernel<T, VEC_SIZE_IN_BYTE, num_warps, maxnreg>);
 
-    dim3 grid(persistent_ctas, 1, 1);
-    // Kernel Launch
-    TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
-    rms_norm_vector_kernel_plus<T, VEC_SIZE_IN_BYTE, num_threads><<<grid, block, smem_size, stream>>>(
-      input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps), shm_for_inp
-    );
-  }
+  cudaFuncAttributes kernel_attr;
+  AT_CUDA_CHECK(cudaFuncGetAttributes(&kernel_attr, kernel_ptr));
+  AT_CUDA_CHECK(cudaFuncSetAttribute(
+    kernel_ptr,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin - kernel_attr.sharedSizeBytes));
+
+  size_t smem_size = 0;
+  AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, num_ctas_per_sm, num_threads));
+  uint persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm;
+  int shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
+  TORCH_CHECK(shm_for_inp >= (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE), "hidden_dim too large.");
+
+  dim3 grid(persistent_ctas, 1, 1);
+  // Kernel Launch
+  TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
+  rms_norm_vector_reg_shm_kernel<T, VEC_SIZE_IN_BYTE, num_warps, maxnreg><<<grid, block, smem_size, stream>>>(
+    input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps), shm_for_inp
+  );
 }
 
 template<typename T>
@@ -592,22 +597,46 @@ void launch_rms_norm(
     int hidden_dim,
     double eps,
     cudaStream_t stream) {
-  if (at::cuda::getCurrentDeviceProperties()->major >= 10) {
-    constexpr int max_vec_size_byte = 32;
+  auto cc_major = at::cuda::getCurrentDeviceProperties()->major;
+  TORCH_CHECK(cc_major >= 9, "High Performance RMSNorm only support in cc >= 90.");
+  if ((cc_major == 9 && hidden_dim <= 8192) || (cc_major == 10 && hidden_dim <= 16384)) {
+    int max_vec_size_byte = 0;
+    if (cc_major == 10) {
+      max_vec_size_byte = 32;
+    } else {
+      max_vec_size_byte = 16;
+    }
     int elements_in_vec = max_vec_size_byte / sizeof(T);
-    assert(hidden_dim % elements_in_vec == 0);
+    TORCH_CHECK(hidden_dim % elements_in_vec == 0, "High Performance RMSNorm need hidden_dim align to max_vec_size");
+
     int vec_hidden_dim = hidden_dim / elements_in_vec;
-    launch_rms_norm_vector<T, max_vec_size_byte>(
-      input, weight, residual, tokens, vec_hidden_dim, eps, stream
-    );
-  } else if (at::cuda::getCurrentDeviceProperties()->major == 9) {
-    constexpr int max_vec_size_byte = 16;
-    int elements_in_vec = max_vec_size_byte / sizeof(T);
-    assert(hidden_dim % elements_in_vec == 0);
-    int vec_hidden_dim = hidden_dim / elements_in_vec;
-    launch_rms_norm_vector<T, max_vec_size_byte>(
-      input, weight, residual, tokens, vec_hidden_dim, eps, stream
-    );
+    if (max_vec_size_byte == 32) {
+      launch_rms_norm_vector_reg<T, 32>(
+        input, weight, residual, tokens, vec_hidden_dim, eps, stream
+      );
+    } else if (max_vec_size_byte == 16) {
+      launch_rms_norm_vector_reg<T, 16>(
+        input, weight, residual, tokens, vec_hidden_dim, eps, stream
+      );
+    };
+  } else {
+    if (cc_major == 9) {
+      constexpr int max_vec_size_byte = 16;
+      int elements_in_vec = max_vec_size_byte / sizeof(T);
+      int vec_hidden_dim = hidden_dim / elements_in_vec;
+      launch_rms_norm_vector_reg_shm<T, max_vec_size_byte, 1024, 2>(
+        input, weight, residual, tokens, vec_hidden_dim, eps, stream
+      );
+    } else if (cc_major == 10) {
+      constexpr int max_vec_size_byte = 32;
+      int elements_in_vec = max_vec_size_byte / sizeof(T);
+      int vec_hidden_dim = hidden_dim / elements_in_vec;
+      launch_rms_norm_vector_reg_shm<T, max_vec_size_byte, 512, 2>(
+        input, weight, residual, tokens, vec_hidden_dim, eps, stream
+      );
+    } else {
+      TORCH_CHECK(false, "Unreachable.")
+    }
   }
 }
 
