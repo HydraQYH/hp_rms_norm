@@ -563,7 +563,7 @@ void launch_rms_norm_vector_reg_shm(
   constexpr int num_threads = NUM_THREADS;
   constexpr int num_warps = NUM_THREADS / 32;
   constexpr int num_ctas_per_sm = NUM_CTAS_PER_SM;
-  constexpr int maxnreg = (num_warps == 1024 ? 32 : 64);
+  constexpr int maxnreg = (num_threads == 1024 ? 32 : 64);
   dim3 block(num_threads, 1, 1);
   void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_reg_shm_kernel<T, VEC_SIZE_IN_BYTE, num_warps, maxnreg>);
 
