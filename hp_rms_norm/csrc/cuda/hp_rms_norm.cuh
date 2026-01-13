@@ -27,12 +27,14 @@ union U16B_f162{
 };
 
 union U32B_bf162{
-  longlong4_32a memory_type;
+  // longlong4_32a memory_type;
+  longlong4 memory_type;
   __nv_bfloat162 real_type[8];
 };
 
 union U32B_f162{
-  longlong4_32a memory_type;
+  // longlong4_32a memory_type;
+  longlong4 memory_type;
   __half2 real_type[8];
 };
 
@@ -51,12 +53,14 @@ template<> struct UVTypeTrait<__half, 16> {
 
 template<> struct UVTypeTrait<__nv_bfloat16, 32> {
   using U = U32B_bf162;
-  using V = longlong4_32a;
+  // using V = longlong4_32a;
+  using V = longlong4;
 };
 
 template<> struct UVTypeTrait<__half, 32> {
   using U = U32B_f162;
-  using V = longlong4_32a;
+  // using V = longlong4_32a;
+  using V = longlong4;
 };
 
 template<typename T>
@@ -574,8 +578,8 @@ void launch_rms_norm_vector_reg_shm(
     cudaFuncAttributeMaxDynamicSharedMemorySize,
     at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin - kernel_attr.sharedSizeBytes));
 
-  size_t smem_size = 0;
-  AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, num_ctas_per_sm, num_threads));
+  size_t smem_size = 81920;
+  // AT_CUDA_CHECK(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel_ptr, num_ctas_per_sm, num_threads));
   uint persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm;
   int shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
   TORCH_CHECK(shm_for_inp >= (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE), "hidden_dim too large.");
