@@ -646,9 +646,15 @@ void launch_rms_norm(
       constexpr int max_vec_size_byte = 16;
       int elements_in_vec = max_vec_size_byte / sizeof(T);
       int vec_hidden_dim = hidden_dim / elements_in_vec;
+#if __CUDACC_VER_MAJOR__ >= 13
+      launch_rms_norm_vector_reg_shm<T, max_vec_size_byte, 512, 2>(
+        input, weight, residual, tokens, vec_hidden_dim, eps, stream
+      );
+#else
       launch_rms_norm_vector_reg_shm<T, max_vec_size_byte, 1024, 2>(
         input, weight, residual, tokens, vec_hidden_dim, eps, stream
       );
+#endif
     } else if (cc_major == 10) {
       constexpr int max_vec_size_byte = 32;
       int elements_in_vec = max_vec_size_byte / sizeof(T);
