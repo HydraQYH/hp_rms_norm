@@ -30,7 +30,7 @@ union U32B_bf162{
 #if __CUDACC_VER_MAJOR__ >= 13
   longlong4_32a memory_type;
 #else
-  longlong memory_type;
+  longlong4 memory_type;
 #endif
   __nv_bfloat162 real_type[8];
 };
@@ -39,7 +39,7 @@ union U32B_f162{
 #if __CUDACC_VER_MAJOR__ >= 13
   longlong4_32a memory_type;
 #else
-  longlong memory_type;
+  longlong4 memory_type;
 #endif
   __half2 real_type[8];
 };
