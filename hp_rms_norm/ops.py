@@ -13,3 +13,12 @@ def hp_rms_norm(
         residual,
         eps,
     )
+
+def relu(
+    output,
+    input,
+):
+    torch.ops.hp_rms_norm.relu.default(
+        output,
+        input,
+    )

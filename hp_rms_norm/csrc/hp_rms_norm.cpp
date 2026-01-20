@@ -27,11 +27,17 @@ void rms_norm(
     torch::Tensor& residual,
     double eps);
 
+void relu(
+    torch::Tensor& out,
+    const torch::Tensor& input);
+
 // Defines the operators
 TORCH_LIBRARY(hp_rms_norm, m) {
   m.def("rms_norm(Tensor input, Tensor weight, Tensor residual, float eps) -> ()");
+  m.def("relu(Tensor out, Tensor input) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hp_rms_norm, CUDA, m) {
   m.impl("rms_norm", &rms_norm);
+  m.impl("relu", &relu);
 }
