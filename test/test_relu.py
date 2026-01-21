@@ -1,7 +1,6 @@
 import random
 import torch
 import hp_rms_norm
-from flashinfer.norm import fused_add_rmsnorm
 
 def check_diff(tokens: int, hidden_dim: int, dtype: torch.dtype=torch.bfloat16):
   if dtype == torch.bfloat16:
@@ -26,4 +25,10 @@ def check_diff(tokens: int, hidden_dim: int, dtype: torch.dtype=torch.bfloat16):
 
 if __name__ == '__main__':
   cc_major = torch.cuda.get_device_capability()[0]
-  check_diff(4096, 8192, dtype=torch.bfloat16)
+  upper_bound = 32768
+  for dtype in [torch.bfloat16, torch.float16]:
+    for hidden_dim in range(128, upper_bound + 128, 128):
+      tokens = random.randint(1, 4096)
+      check_diff(tokens, hidden_dim, dtype=torch.bfloat16)
+      print(f"Check tokens {tokens}, hidden_dim {hidden_dim}, dtype {dtype} Done!")
+  # check_diff(4096, 8192, dtype=torch.bfloat16)

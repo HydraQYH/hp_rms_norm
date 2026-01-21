@@ -26,7 +26,7 @@ struct CollectiveVector {
   __device__ __always_inline static storage_t load(const storage_t* addr, int threadId) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
     static_assert(std::is_same_v<storage_t, longlong4_32a>);
-    const longlong4_32a* p = reinterpret_cast<const longlong4_32a*>(addr);
+    longlong4_32a* p = reinterpret_cast<longlong4_32a*>(addr);
     return p[threadId];
 #else
     const int4* p = reinterpret_cast<const int4*>(addr);
@@ -41,13 +41,21 @@ struct CollectiveVector {
   }
 
   __device__ __always_inline static int4 load_top(const storage_t* addr, int threadId) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
+    static_assert(false);
+#else
     const int4* p = reinterpret_cast<const int4*>(addr);
     return ldg_prefetch(&p[threadId]);
+#endif
   }
 
   __device__ __always_inline static int4 load_bottom(const storage_t* addr, int threadId) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
+    static_assert(false);
+#else
     const int4* p = reinterpret_cast<const int4*>(addr);
     return p[threadId + threads];
+#endif
   }
 
   __device__ __always_inline static void store(storage_t* addr, int threadId, storage_t& s) {
@@ -68,13 +76,22 @@ struct CollectiveVector {
   }
 
   __device__ __always_inline static void store_top(storage_t* addr, int threadId, int4& s) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
+  static_assert(false);
+#else
     int4* p = reinterpret_cast<int4*>(addr);
     __stcs(&p[threadId], s);
+    
+#endif
   }
 
   __device__ __always_inline static void store_bottom(storage_t* addr, int threadId, int4& s) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
+  static_assert(false);
+#else
     int4* p = reinterpret_cast<int4*>(addr);
     __stcs(&p[threadId + threads], s);
+#endif
   }
 
 };

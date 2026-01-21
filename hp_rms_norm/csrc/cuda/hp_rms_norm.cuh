@@ -137,44 +137,16 @@ __global__ void rms_norm_vector_reg_kernel(
 ) {
   using U = typename UVTypeTrait<T, VEC_SIZE_IN_BYTE>::U;
   using V = typename UVTypeTrait<T, VEC_SIZE_IN_BYTE>::V;
-
-  extern __shared__ __align__(128) uint8_t shared_memory[];
-
-  // Use for warp reduce
   auto cg_warp = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());
 
-  // Used for TMA 1D G2S Copy Sync
-  barrier* mbarrier = reinterpret_cast<barrier*>(shared_memory + vec_hidden_dim * VEC_SIZE_IN_BYTE + 32 * sizeof(float));
-  
-  int token_id = static_cast<int>(blockIdx.x);
-  // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
-  //    b) Make initialized barrier visible in async proxy.
-  if (threadIdx.x == 0) {
-    init(mbarrier, blockDim.x);
-    // cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);   // b)
-  }
-  __syncthreads();
-
-  // 2. Initiate TMA transfer to copy global to shared memory.
-  if (threadIdx.x == 0) {
-    // 3a. cuda::memcpy_async arrives on the barrier and communicates
-    //     how many bytes are expected to come in (the transaction count)
-    cuda::memcpy_async(
-        shared_memory,
-        weight,
-        cuda::aligned_size_t<16>(vec_hidden_dim * VEC_SIZE_IN_BYTE),
-        *mbarrier
-    );
-  }
-
-  // 3b. All threads arrive on the barrier
-  __syncthreads();
-  barrier::arrival_token arrival_token = mbarrier->arrive();
+  __shared__ float shared_memory[32];
 
   U u;  // Save input
   U u_weight; // Save weight
   U u_out;  // Save output
   float2 acc_square = make_float2(0.0f, 0.0f);
+
+  int token_id = static_cast<int>(blockIdx.x);
 
   // Load data
   if (threadIdx.x < vec_hidden_dim) {
@@ -183,6 +155,12 @@ __global__ void rms_norm_vector_reg_kernel(
     u.memory_type = p[threadIdx.x];
     V* p_res = reinterpret_cast<V*>(residual) + token_id * vec_hidden_dim;
     u_res.memory_type = p_res[threadIdx.x];
+    const V* p_weight = reinterpret_cast<const V*>(weight);
+    if constexpr (std::is_same_v<V, int4>) {
+      u_weight.memory_type = __ldg(&p_weight[threadIdx.x]);
+    } else {
+      u_weight.memory_type = p_weight[threadIdx.x];
+    }
 
     if constexpr (VEC_SIZE_IN_BYTE == 16) {
       if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -237,7 +215,7 @@ __global__ void rms_norm_vector_reg_kernel(
   );
 
   // Wirte warp_sum to buffer
-  float* buffer = reinterpret_cast<float*>(shared_memory + vec_hidden_dim * VEC_SIZE_IN_BYTE);
+  float* buffer = shared_memory;
   if (threadIdx.x % 32 == 0) {
     buffer[threadIdx.x / 32] = warp_sum;
   }
@@ -258,11 +236,6 @@ __global__ void rms_norm_vector_reg_kernel(
   if (threadIdx.x < vec_hidden_dim) {
     // Read rsqrt from Shared Memory(Broadcast)
     float rsqrt_square_sum = buffer[threadIdx.x / 32];
-
-    mbarrier->wait(std::move(arrival_token));
-
-    const V* p_weight = reinterpret_cast<const V*>(shared_memory);
-    u_weight.memory_type = p_weight[threadIdx.x];  // LDS
 
     if constexpr (VEC_SIZE_IN_BYTE == 16) {
       for (int i = 0; i < 4; i++) {
@@ -303,42 +276,22 @@ __global__ void __maxnreg__(MAXNREG) rms_norm_vector_reg_shm_kernel(
 
   int token_id = static_cast<int>(blockIdx.x);
 
-  #pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ barrier mbarrier;
-
-  // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
-  //    b) Make initialized barrier visible in async proxy.
-  if (threadIdx.x == 0) {
-    init(&mbarrier, blockDim.x);
-    cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);   // b)
-  }
-  __syncthreads();
-
-  // 2. Initiate TMA transfer to copy global to shared memory.
-  if (threadIdx.x == 0) {
-    // 3a. cuda::memcpy_async arrives on the barrier and communicates
-    //     how many bytes are expected to come in (the transaction count)
-    cuda::memcpy_async(
-        shared_memory,
-        weight,
-        cuda::aligned_size_t<16>(vec_hidden_dim * VEC_SIZE_IN_BYTE),
-        mbarrier
-    );
-  }
-
-  // 3b. All threads arrive on the barrier
-  __syncthreads();
-  barrier::arrival_token arrival_token = mbarrier.arrive();
-
   register U u;  // Save input
   U u_res;
+  U u_weight;
   float2 acc_square = make_float2(0.0f, 0.0f);
 
   // Ptr offset
   const V* p = reinterpret_cast<const V*>(input) + token_id * vec_hidden_dim;
+  const V* p_weight = reinterpret_cast<const V*>(weight);
   V* p_res = reinterpret_cast<V*>(residual) + token_id * vec_hidden_dim;
   u.memory_type = p[threadIdx.x];
   u_res.memory_type = p_res[threadIdx.x];
+  if constexpr (std::is_same_v<V, int4>) {
+    u_weight.memory_type = __ldg(&p_weight[threadIdx.x]);
+  } else {
+    u_weight.memory_type = p_weight[threadIdx.x];
+  }
   if constexpr (VEC_SIZE_IN_BYTE == 16) {
     if constexpr (std::is_same_v<T, __nv_bfloat16>) {
       for (int i = 0; i < 4; i++) {
@@ -445,7 +398,7 @@ __global__ void __maxnreg__(MAXNREG) rms_norm_vector_reg_shm_kernel(
   );
 
   // Wirte warp_sum to buffer
-  float* buffer = reinterpret_cast<float*>(shared_memory + vec_hidden_dim * VEC_SIZE_IN_BYTE + shm_for_inp );
+  float* buffer = reinterpret_cast<float*>(shared_memory + shm_for_inp);
   if (threadIdx.x % 32 == 0) {
     buffer[threadIdx.x / 32] = warp_sum;
   }
@@ -463,15 +416,8 @@ __global__ void __maxnreg__(MAXNREG) rms_norm_vector_reg_shm_kernel(
   __syncthreads();
   float scale = buffer[threadIdx.x / 32];
 
-  // First time
-  mbarrier.wait(std::move(arrival_token));
-
   V* p_out = reinterpret_cast<V*>(input) + token_id * vec_hidden_dim;
-  V* p_weight = reinterpret_cast<V*>(shared_memory);
-
   U u_out;
-  U u_weight;
-  u_weight.memory_type = p_weight[threadIdx.x];  // LDS
   if constexpr (VEC_SIZE_IN_BYTE == 16) {
     // #pragma unroll 1
     for (int j = 0; j < 4; j++) {
@@ -488,7 +434,11 @@ __global__ void __maxnreg__(MAXNREG) rms_norm_vector_reg_shm_kernel(
   for (int i = 1; i < iteration; i++) {
     auto offset = threadIdx.x + i * threads;
     if (offset < vec_hidden_dim) {
-      u_weight.memory_type = p_weight[offset];  // LDS
+      if constexpr (std::is_same_v<V, int4>) {
+        u_weight.memory_type = __ldg(&p_weight[offset]);
+      } else {
+        u_weight.memory_type = p_weight[offset];
+      }
       U shm_inp;
       auto shm_offset = threadIdx.x + (i - 1) * threads;
       shm_inp.memory_type = p_shm[shm_offset];
@@ -521,26 +471,12 @@ void launch_rms_norm_vector_reg(
 ) {
   // Align to 32(warp)
   uint threads = (vec_hidden_dim + 31) / 32 * 32;
-
   dim3 block(threads, 1, 1);
-  // 32 * sizeof(float) -- CTA Reduce
-  // vec_hidden_dim * VEC_SIZE_IN_BYTE -- Save weight
-  // 8 -- mbarrier
-  int smem_size = 32 * sizeof(float) + vec_hidden_dim * VEC_SIZE_IN_BYTE + 8;
-  void const* kernel_ptr = reinterpret_cast<void const*>(&rms_norm_vector_reg_kernel<T, VEC_SIZE_IN_BYTE>);
-  AT_CUDA_CHECK(cudaFuncSetAttribute(
-    kernel_ptr,
-    cudaFuncAttributeMaxDynamicSharedMemorySize,
-    smem_size)
-  );
-
-  // int max_active_blocks_per_sm = -1;
-  // AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_active_blocks_per_sm, kernel_ptr, threads, smem_size));
   dim3 grid(static_cast<uint>(tokens), 1, 1);
 
   // Kernel Launch
   TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
-  rms_norm_vector_reg_kernel<T, VEC_SIZE_IN_BYTE><<<grid, block, smem_size, stream>>>(
+  rms_norm_vector_reg_kernel<T, VEC_SIZE_IN_BYTE><<<grid, block, 0, stream>>>(
     input, weight, residual, static_cast<int>(tokens), vec_hidden_dim, static_cast<float>(eps)
   );
 }
@@ -577,8 +513,8 @@ void launch_rms_norm_vector_reg_shm(
   } else {
     smem_size = 81920;
   }
-  // uint persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm;
-  int shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
+
+  int shm_for_inp = static_cast<int>(smem_size) - 128;
   TORCH_CHECK(shm_for_inp >= (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE), "hidden_dim too large.");
 
   dim3 grid(static_cast<uint>(tokens), 1, 1);
