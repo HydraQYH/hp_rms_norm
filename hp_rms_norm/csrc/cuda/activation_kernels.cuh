@@ -112,16 +112,27 @@ __global__ void activation_kernel(
   uint token_id = blockIdx.x;
   const scalar_t* p_input = input + token_id * d;
   scalar_t* p_out = out + token_id * d;
+  auto collective_rank = collective.meta_group_rank();
   if constexpr (!loop) {
-    auto collective_rank = collective.meta_group_rank();
     const storage_t* _p_input = reinterpret_cast<const storage_t*>(reinterpret_cast<const char*>(p_input) + collective_rank * 256);
     storage_t* _p_out = reinterpret_cast<storage_t*>(reinterpret_cast<char*>(p_out) + collective_rank * 256);
     storage_t val = CollectiveVector::load(_p_input, collective.thread_rank());
     CollectiveVector::store(_p_out, collective.thread_rank(), val);
   } else {
-    
+    // 1024 threads -> 128 quarter warps
+    constexpr int elements_per_iteration = 128 * (256 / sizeof(scalar_t));
+    int iterations = d + (elements_per_iteration - 1) / elements_per_iteration; // cdiv
+    for (int i = 0; i < iterations; i++) {
+      if ((i * elements_per_iteration + collective_rank * (256 / sizeof(scalar_t))) < d) {
+        const storage_t* _p_input = reinterpret_cast<const storage_t*>(
+          reinterpret_cast<const char*>(p_input) + i * 128 * 256 + collective_rank * 256);
+        storage_t* _p_out = reinterpret_cast<storage_t*>(
+          reinterpret_cast<char*>(p_out) + i * 128 * 256 + collective_rank * 256);
+        storage_t val = CollectiveVector::load(_p_input, collective.thread_rank());
+        CollectiveVector::store(_p_out, collective.thread_rank(), val);
+      }
 
-
+    }
   }
 }
 
