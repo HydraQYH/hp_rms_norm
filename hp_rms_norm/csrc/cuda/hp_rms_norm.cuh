@@ -276,186 +276,220 @@ __global__ void __maxnreg__(MAXNREG) rms_norm_vector_reg_shm_kernel(
 
   int token_id = static_cast<int>(blockIdx.x);
 
-  register U u;  // Save input
-  U u_res;
-  U u_weight;
-  float2 acc_square = make_float2(0.0f, 0.0f);
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ barrier mbarrier;
 
-  // Ptr offset
-  const V* p = reinterpret_cast<const V*>(input) + token_id * vec_hidden_dim;
-  const V* p_weight = reinterpret_cast<const V*>(weight);
-  V* p_res = reinterpret_cast<V*>(residual) + token_id * vec_hidden_dim;
-  u.memory_type = p[threadIdx.x];
-  u_res.memory_type = p_res[threadIdx.x];
-  if constexpr (std::is_same_v<V, int4>) {
-    u_weight.memory_type = __ldg(&p_weight[threadIdx.x]);
+  if (token_id < tokens) {
+    // 1. a) Initialize shared memory barrier with the number of threads participating in the barrier.
+    //    b) Make initialized barrier visible in async proxy.
+    if (threadIdx.x == 0) {
+      init(&mbarrier, blockDim.x);
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);   // b)
+    }
+    __syncthreads();
+
+    // 2. Initiate TMA transfer to copy global to shared memory.
+    if (threadIdx.x == 0) {
+      // 3a. cuda::memcpy_async arrives on the barrier and communicates
+      //     how many bytes are expected to come in (the transaction count)
+      cuda::memcpy_async(
+          shared_memory,
+          weight,
+          cuda::aligned_size_t<16>(vec_hidden_dim * VEC_SIZE_IN_BYTE),
+          mbarrier
+      );
+    }
   } else {
-    u_weight.memory_type = p_weight[threadIdx.x];
-  }
-  if constexpr (VEC_SIZE_IN_BYTE == 16) {
-    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-      for (int i = 0; i < 4; i++) {
-        float2 val = __bfloat1622float2(u.real_type[i]);
-        float2 res = __bfloat1622float2(u_res.real_type[i]);
-        float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-        acc_square.x += inp_res.x * inp_res.x;
-        acc_square.y += inp_res.y * inp_res.y;
-        u.real_type[i] = __float22bfloat162_rn(inp_res);
-      }
-    } else if constexpr (std::is_same_v<T, __half>) {
-      for (int i = 0; i < 4; i++) {
-        float2 val = __half22float2(u.real_type[i]);
-        float2 res = __half22float2(u_res.real_type[i]);
-        float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-        acc_square.x += inp_res.x * inp_res.x;
-        acc_square.y += inp_res.y * inp_res.y;
-        u.real_type[i] = __float22half2_rn(inp_res);
-      }
-    }
-  } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
-    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-      for (int i = 0; i < 8; i++) {
-        float2 val = __bfloat1622float2(u.real_type[i]);
-        float2 res = __bfloat1622float2(u_res.real_type[i]);
-        float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-        acc_square.x += inp_res.x * inp_res.x;
-        acc_square.y += inp_res.y * inp_res.y;
-        u.real_type[i] = __float22bfloat162_rn(inp_res);
-      }
-    } else if constexpr (std::is_same_v<T, __half>) {
-      for (int i = 0; i < 8; i++) {
-        float2 val = __half22float2(u.real_type[i]);
-        float2 res = __half22float2(u_res.real_type[i]);
-        float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-        acc_square.x += inp_res.x * inp_res.x;
-        acc_square.y += inp_res.y * inp_res.y;
-        u.real_type[i] = __float22half2_rn(inp_res);
-      }
-    }
-  }
-  p_res[threadIdx.x] = u.memory_type;
-
-  V* p_shm = reinterpret_cast<V*>(shared_memory + VEC_SIZE_IN_BYTE * vec_hidden_dim);
-  for (int i = 1; i < iteration; i++) {
-    auto offset = threadIdx.x + i * threads;
-    if (offset < vec_hidden_dim) {
-      // Store in shared memory
-      U tmp;
-      tmp.memory_type = p[offset];
-      u_res.memory_type = p_res[offset];
-      if constexpr (VEC_SIZE_IN_BYTE == 16) {
-        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-          for (int j = 0; j < 4; j++) {
-            float2 val = __bfloat1622float2(tmp.real_type[j]);
-            float2 res = __bfloat1622float2(u_res.real_type[j]);
-            float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-            acc_square.x += inp_res.x * inp_res.x;
-            acc_square.y += inp_res.y * inp_res.y;
-            tmp.real_type[j] = __float22bfloat162_rn(inp_res);
-          }
-        } else if constexpr (std::is_same_v<T, __half>) {
-          for (int j = 0; j < 4; j++) {
-            float2 val = __half22float2(tmp.real_type[j]);
-            float2 res = __half22float2(u_res.real_type[j]);
-            float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-            acc_square.x += inp_res.x * inp_res.x;
-            acc_square.y += inp_res.y * inp_res.y;
-            tmp.real_type[j] = __float22half2_rn(inp_res);
-          }
-        }
-      } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
-        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-          for (int j = 0; j < 8; j++) {
-            float2 val = __bfloat1622float2(tmp.real_type[j]);
-            float2 res = __bfloat1622float2(u_res.real_type[j]);
-            float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-            acc_square.x += inp_res.x * inp_res.x;
-            acc_square.y += inp_res.y * inp_res.y;
-            tmp.real_type[j] = __float22bfloat162_rn(inp_res);
-          }
-        } else if constexpr (std::is_same_v<T, __half>) {
-          for (int j = 0; j < 8; j++) {
-            float2 val = __half22float2(tmp.real_type[j]);
-            float2 res = __half22float2(u_res.real_type[j]);
-            float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
-            acc_square.x += inp_res.x * inp_res.x;
-            acc_square.y += inp_res.y * inp_res.y;
-            tmp.real_type[j] = __float22half2_rn(inp_res);
-          }
-        }
-      }
-      auto shm_offset = threadIdx.x + (i - 1) * threads;
-      p_shm[shm_offset] = tmp.memory_type;
-      p_res[offset] = tmp.memory_type;
-    }
+    return;
   }
 
-  // Warp Reduce
-  float warp_sum = cooperative_groups::reduce(
-    cg_warp,
-    acc_square.x + acc_square.y,
-    cooperative_groups::plus<float>()
-  );
-
-  // Wirte warp_sum to buffer
-  float* buffer = reinterpret_cast<float*>(shared_memory + shm_for_inp);
-  if (threadIdx.x % 32 == 0) {
-    buffer[threadIdx.x / 32] = warp_sum;
-  }
-
-  // CTA Reduce
+  // 3b. All threads arrive on the barrier
   __syncthreads();
-  if (threadIdx.x < 32) {
-    float cta_sum = cooperative_groups::reduce(
+  barrier::arrival_token arrival_token = mbarrier.arrive();
+
+  while (token_id < tokens) {
+    register U u;  // Save input
+    U u_res;
+    float2 acc_square = make_float2(0.0f, 0.0f);
+
+    // Ptr offset
+    const V* p = reinterpret_cast<const V*>(input) + token_id * vec_hidden_dim;
+    V* p_res = reinterpret_cast<V*>(residual) + token_id * vec_hidden_dim;
+    u.memory_type = p[threadIdx.x];
+    u_res.memory_type = p_res[threadIdx.x];
+    if constexpr (VEC_SIZE_IN_BYTE == 16) {
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        for (int i = 0; i < 4; i++) {
+          float2 val = __bfloat1622float2(u.real_type[i]);
+          float2 res = __bfloat1622float2(u_res.real_type[i]);
+          float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+          acc_square.x += inp_res.x * inp_res.x;
+          acc_square.y += inp_res.y * inp_res.y;
+          u.real_type[i] = __float22bfloat162_rn(inp_res);
+        }
+      } else if constexpr (std::is_same_v<T, __half>) {
+        for (int i = 0; i < 4; i++) {
+          float2 val = __half22float2(u.real_type[i]);
+          float2 res = __half22float2(u_res.real_type[i]);
+          float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+          acc_square.x += inp_res.x * inp_res.x;
+          acc_square.y += inp_res.y * inp_res.y;
+          u.real_type[i] = __float22half2_rn(inp_res);
+        }
+      }
+    } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        for (int i = 0; i < 8; i++) {
+          float2 val = __bfloat1622float2(u.real_type[i]);
+          float2 res = __bfloat1622float2(u_res.real_type[i]);
+          float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+          acc_square.x += inp_res.x * inp_res.x;
+          acc_square.y += inp_res.y * inp_res.y;
+          u.real_type[i] = __float22bfloat162_rn(inp_res);
+        }
+      } else if constexpr (std::is_same_v<T, __half>) {
+        for (int i = 0; i < 8; i++) {
+          float2 val = __half22float2(u.real_type[i]);
+          float2 res = __half22float2(u_res.real_type[i]);
+          float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+          acc_square.x += inp_res.x * inp_res.x;
+          acc_square.y += inp_res.y * inp_res.y;
+          u.real_type[i] = __float22half2_rn(inp_res);
+        }
+      }
+    }
+    p_res[threadIdx.x] = u.memory_type;
+
+    V* p_shm = reinterpret_cast<V*>(shared_memory + VEC_SIZE_IN_BYTE * vec_hidden_dim);
+    for (int i = 1; i < iteration; i++) {
+      auto offset = threadIdx.x + i * threads;
+      if (offset < vec_hidden_dim) {
+        // Store in shared memory
+        U tmp;
+        tmp.memory_type = p[offset];
+        u_res.memory_type = p_res[offset];
+        if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            for (int j = 0; j < 4; j++) {
+              float2 val = __bfloat1622float2(tmp.real_type[j]);
+              float2 res = __bfloat1622float2(u_res.real_type[j]);
+              float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+              acc_square.x += inp_res.x * inp_res.x;
+              acc_square.y += inp_res.y * inp_res.y;
+              tmp.real_type[j] = __float22bfloat162_rn(inp_res);
+            }
+          } else if constexpr (std::is_same_v<T, __half>) {
+            for (int j = 0; j < 4; j++) {
+              float2 val = __half22float2(tmp.real_type[j]);
+              float2 res = __half22float2(u_res.real_type[j]);
+              float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+              acc_square.x += inp_res.x * inp_res.x;
+              acc_square.y += inp_res.y * inp_res.y;
+              tmp.real_type[j] = __float22half2_rn(inp_res);
+            }
+          }
+        } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            for (int j = 0; j < 8; j++) {
+              float2 val = __bfloat1622float2(tmp.real_type[j]);
+              float2 res = __bfloat1622float2(u_res.real_type[j]);
+              float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+              acc_square.x += inp_res.x * inp_res.x;
+              acc_square.y += inp_res.y * inp_res.y;
+              tmp.real_type[j] = __float22bfloat162_rn(inp_res);
+            }
+          } else if constexpr (std::is_same_v<T, __half>) {
+            for (int j = 0; j < 8; j++) {
+              float2 val = __half22float2(tmp.real_type[j]);
+              float2 res = __half22float2(u_res.real_type[j]);
+              float2 inp_res = make_float2(val.x + res.x, val.y + res.y);
+              acc_square.x += inp_res.x * inp_res.x;
+              acc_square.y += inp_res.y * inp_res.y;
+              tmp.real_type[j] = __float22half2_rn(inp_res);
+            }
+          }
+        }
+        auto shm_offset = threadIdx.x + (i - 1) * threads;
+        p_shm[shm_offset] = tmp.memory_type;
+        p_res[offset] = tmp.memory_type;
+      }
+    }
+
+    // Warp Reduce
+    float warp_sum = cooperative_groups::reduce(
       cg_warp,
-      threadIdx.x < NUM_WARPS ? buffer[threadIdx.x] : 0.0f,
+      acc_square.x + acc_square.y,
       cooperative_groups::plus<float>()
     );
-    buffer[threadIdx.x] = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T)))));
-  }
-  __syncthreads();
-  float scale = buffer[threadIdx.x / 32];
 
-  V* p_out = reinterpret_cast<V*>(input) + token_id * vec_hidden_dim;
-  U u_out;
-  if constexpr (VEC_SIZE_IN_BYTE == 16) {
-    // #pragma unroll 1
-    for (int j = 0; j < 4; j++) {
-      u_out.real_type[j] = rms(u.real_type[j], u_weight.real_type[j], scale);
+    // Wirte warp_sum to buffer
+    float* buffer = reinterpret_cast<float*>(shared_memory + vec_hidden_dim * VEC_SIZE_IN_BYTE + shm_for_inp );
+    if (threadIdx.x % 32 == 0) {
+      buffer[threadIdx.x / 32] = warp_sum;
     }
-  } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
-    // #pragma unroll 1
-    for (int j = 0; j < 8; j++) {
-      u_out.real_type[j] = rms(u.real_type[j], u_weight.real_type[j], scale);
-    }
-  }
-  p_out[threadIdx.x] = u_out.memory_type;
 
-  for (int i = 1; i < iteration; i++) {
-    auto offset = threadIdx.x + i * threads;
-    if (offset < vec_hidden_dim) {
-      if constexpr (std::is_same_v<V, int4>) {
-        u_weight.memory_type = __ldg(&p_weight[offset]);
-      } else {
-        u_weight.memory_type = p_weight[offset];
+    // CTA Reduce
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      float cta_sum = cooperative_groups::reduce(
+        cg_warp,
+        threadIdx.x < NUM_WARPS ? buffer[threadIdx.x] : 0.0f,
+        cooperative_groups::plus<float>()
+      );
+      buffer[threadIdx.x] = rsqrtf(eps + cta_sum * (1.0f / static_cast<float>(vec_hidden_dim * (VEC_SIZE_IN_BYTE / sizeof(T)))));
+    }
+    __syncthreads();
+    float scale = buffer[threadIdx.x / 32];
+
+    if (token_id == static_cast<int>(blockIdx.x)) {
+      // First time
+      mbarrier.wait(std::move(arrival_token));
+    }
+
+    V* p_out = reinterpret_cast<V*>(input) + token_id * vec_hidden_dim;
+    V* p_weight = reinterpret_cast<V*>(shared_memory);
+
+    U u_out;
+    U u_weight;
+    u_weight.memory_type = p_weight[threadIdx.x];  // LDS
+    if constexpr (VEC_SIZE_IN_BYTE == 16) {
+      // #pragma unroll 1
+      for (int j = 0; j < 4; j++) {
+        u_out.real_type[j] = rms(u.real_type[j], u_weight.real_type[j], scale);
       }
-      U shm_inp;
-      auto shm_offset = threadIdx.x + (i - 1) * threads;
-      shm_inp.memory_type = p_shm[shm_offset];
-
-      if constexpr (VEC_SIZE_IN_BYTE == 16) {
-        // #pragma unroll 1
-        for (int j = 0; j < 4; j++) {
-          u_out.real_type[j] = rms(shm_inp.real_type[j], u_weight.real_type[j], scale);
-        }
-      } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
-        // #pragma unroll 1
-        for (int j = 0; j < 8; j++) {
-          u_out.real_type[j] = rms(shm_inp.real_type[j], u_weight.real_type[j], scale);
-        }
+    } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+      // #pragma unroll 1
+      for (int j = 0; j < 8; j++) {
+        u_out.real_type[j] = rms(u.real_type[j], u_weight.real_type[j], scale);
       }
-      p_out[offset] = u_out.memory_type;
     }
+    p_out[threadIdx.x] = u_out.memory_type;
+
+    for (int i = 1; i < iteration; i++) {
+      auto offset = threadIdx.x + i * threads;
+      if (offset < vec_hidden_dim) {
+        u_weight.memory_type = p_weight[offset];  // LDS
+        U shm_inp;
+        auto shm_offset = threadIdx.x + (i - 1) * threads;
+        shm_inp.memory_type = p_shm[shm_offset];
+
+        if constexpr (VEC_SIZE_IN_BYTE == 16) {
+          // #pragma unroll 1
+          for (int j = 0; j < 4; j++) {
+            u_out.real_type[j] = rms(shm_inp.real_type[j], u_weight.real_type[j], scale);
+          }
+        } else if constexpr (VEC_SIZE_IN_BYTE == 32) {
+          // #pragma unroll 1
+          for (int j = 0; j < 8; j++) {
+            u_out.real_type[j] = rms(shm_inp.real_type[j], u_weight.real_type[j], scale);
+          }
+        }
+        p_out[offset] = u_out.memory_type;
+      }
+    }
+
+    // Move to next token
+    token_id += static_cast<int>(gridDim.x);
   }
 }
 
@@ -513,11 +547,11 @@ void launch_rms_norm_vector_reg_shm(
   } else {
     smem_size = 81920;
   }
-
-  int shm_for_inp = static_cast<int>(smem_size) - 128;
+  uint persistent_ctas = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * num_ctas_per_sm;
+  int shm_for_inp = static_cast<int>(smem_size) - vec_hidden_dim * VEC_SIZE_IN_BYTE - 128;
   TORCH_CHECK(shm_for_inp >= (vec_hidden_dim * VEC_SIZE_IN_BYTE - num_threads * VEC_SIZE_IN_BYTE), "hidden_dim too large.");
 
-  dim3 grid(static_cast<uint>(tokens), 1, 1);
+  dim3 grid(persistent_ctas, 1, 1);
   // Kernel Launch
   TORCH_CHECK(tokens <= INT32_MAX, "tokens <= INT32_MAX");
   rms_norm_vector_reg_shm_kernel<T, VEC_SIZE_IN_BYTE, num_warps, maxnreg><<<grid, block, smem_size, stream>>>(
